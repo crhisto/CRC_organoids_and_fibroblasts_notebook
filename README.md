@@ -29,4 +29,4 @@ In order to execute the complete pipeline, at the beginning of the R Notebook th
    - **Modifications**: Compatibility with sparse matrices using: `dgCMatrix` objects in R.
    - **Original repository**: https://github.com/renozao/xbioc
             
-Publication: [add final title](https://www.doi.org/)
+Publication: [Colorectal cancer organoids-fibroblast co-cultures closely recapitulate in vivo tumors as revealed by RNA sequencing and histochemical analyses](https://www.doi.org/)
