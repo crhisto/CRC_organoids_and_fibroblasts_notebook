@@ -5,8 +5,9 @@ You can find the following files in the repository:
 1. **R Notebook with examples:** [CRC_organoids_and_fibroblasts_notebook.Rmd](CRC_organoids_and_fibroblasts_notebook.Rmd)
 2. **Html with examples:** [CRC_organoids_and_fibroblasts_notebook.html](https://htmlpreview.github.io/?https://github.com/crhisto/CRC_organoids_and_fibroblasts_notebook/blob/master/CRC_organoids_and_fibroblasts_notebook.html)
 2. **Additional R functions:** [generic_functions.R](scripts/generic_functions.R)
-3. **Files with the Bulk data:** [merged_rsem_counts_annotated.tsv.zip](data/bulk_dataset/merged_rsem_counts_annotated.tsv.zip)
-
+3. **Files with the Bulk data:** 
+      - Count matrix: [merged_rsem_counts_annotated.tsv.zip](data/bulk_dataset/merged_rsem_counts_annotated.tsv.zip)
+      - Labels of samples: [label_translation_samples.csv.zip](data/bulk_dataset/label_translation_samples.csv.zip)
 ## Libraries 
 
 In order to execute the complete pipeline, at the beginning of the R Notebook the following modified libraries must be installed:
