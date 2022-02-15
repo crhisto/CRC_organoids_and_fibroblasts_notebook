@@ -5,8 +5,9 @@ You can find the following files in the repository:
 1. **R Notebook with examples:** [CRC_organoids_and_fibroblasts_notebook.Rmd](CRC_organoids_and_fibroblasts_notebook.Rmd)
 2. **Html with examples:** [CRC_organoids_and_fibroblasts_notebook.html](https://htmlpreview.github.io/?https://github.com/crhisto/CRC_organoids_and_fibroblasts_notebook/blob/master/CRC_organoids_and_fibroblasts_notebook.html)
 2. **Additional R functions:** [generic_functions.R](scripts/generic_functions.R)
-3. **R file with the Bulk data object:** [eset.bulk.colorectal.RData.zip](data/eset.bulk.colorectal.RData.zip)
-
+3. **Files with the Bulk data:** 
+      - Count matrix: [merged_rsem_counts_annotated.tsv.zip](data/bulk_dataset/merged_rsem_counts_annotated.tsv.zip)
+      - Labels of samples: [label_translation_samples.csv.zip](data/bulk_dataset/label_translation_samples.csv.zip)
 ## Libraries 
 
 In order to execute the complete pipeline, at the beginning of the R Notebook the following modified libraries must be installed:
@@ -29,4 +30,4 @@ In order to execute the complete pipeline, at the beginning of the R Notebook th
    - **Modifications**: Compatibility with sparse matrices using: `dgCMatrix` objects in R.
    - **Original repository**: https://github.com/renozao/xbioc
             
-Publication: [add final title](https://www.doi.org/)
+Publication: [Colorectal cancer organoids-fibroblast co-cultures closely recapitulate in vivo tumors as revealed by RNA sequencing and histochemical analyses](https://www.doi.org/)
