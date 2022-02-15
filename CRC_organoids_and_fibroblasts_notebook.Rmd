@@ -1,0 +1,1141 @@
+---
+title: "Deconvolution of CRC in organoids and fibroblast bulk data identifying epithelial cell types proportions."
+author: "Crhistian Cardona"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+**Computational Epigenomics Research group:** [epi-logos.com](https://epi-logos.com/)
+
+# Context
+
+We use a modified version of [SCDC library](https://meichendong.github.io/SCDC/articles/SCDC.html) to conduct the bulk RNA-seq data deconvolution with a sc-RNA-seq reference dataset described in both: [Lineage-dependent gene expression programs influence the immune landscape of colorectal cancer](https://doi.org/10.1038/s41588-020-0636-z) and [A pan-cancer blueprint of the heterogeneous tumor microenvironment revealed by single-cell profiling](https://doi.org/10.1038/s41422-020-0355-0). In the following markdown file, we are going to show how we used the deconvolution library to calculate the cell type proportions of each replica in the organoid and fibroblast bulk samples, comparing those with the actual proportions of the single-cell samples and finally, we will check the marker genes expression amount the samples in the organoids through some heatmap plots.
+
+Our paper: "Colorectal cancer organoids-fibroblast co-cultures closely recapitulate in vivo tumors as revealed by RNA sequencing and histochemical analyses" is published at [Science Translational Medicine](https://doi.org/).
+
+First, we have to install 2 libraries that have been modified in order to use sparse matrices in R: originally in [Biobase](https://github.com/Bioconductor/Biobase) and [xbioc](https://github.com/renozao/xbioc). Then we imported a improved version of the library [SCDC](https://meichendong.github.io/SCDC/articles/SCDC.html) that has been modified to support: sparse matrices, parallelism, and Dynamic threshold for markers selection, among other improvements. Finally, we imported the general libraries required to run the complete pipeline.
+```{r importing_libraries, include=FALSE}
+if (!require("devtools")) {
+  install.packages("devtools")
+}
+
+#Check Biobase modified installation
+if("Biobase" %in% rownames(installed.packages())){
+  library(Biobase)
+}else{
+  devtools::install_github( repo = "crhisto/Biobase" )
+  library(Biobase)
+}
+
+#Check xbioc modified installation
+if("xbioc" %in% rownames(installed.packages())){
+  library(xbioc)
+}else{
+  devtools::install_github( repo = "crhisto/xbioc" )
+  library(xbioc)
+}
+
+#Check SCDC modified installation
+if("SCDC" %in% rownames(installed.packages())){
+  library(SCDC)
+}else{
+  devtools::install_github( repo = "crhisto/SCDC" )
+  library(SCDC)
+}
+
+#Check hdf5r installation
+if("hdf5r" %in% rownames(installed.packages())){
+  library(hdf5r)
+}else{
+  #install the package hdf5r
+  #Use the following command in ubuntu linux: sudo apt-get install libhdf5-dev
+  install.packages("hdf5r")
+  library(hdf5r)
+}
+
+#Other libraries.
+library(pheatmap)
+library(foreach)
+library(doParallel)
+library(Seurat)
+library(fpc)
+library(tidyverse)
+library(fpc)
+library(stringr)
+library(dbscan)
+library(slam)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(DESeq2)
+library(BiocGenerics)
+library(Matrix)
+library(data.table)
+library(future)
+```
+
+The generic functions have been saved in the scripting file: scripts/generic_functions.R"
+```{r importing_script}
+source("scripts/generic_functions.R", local = knitr::knit_global())
+path.data <- paste0(getwd(), '/', 'data/')
+```
+
+#Bulk data importing
+
+We have to download the bulk dataset and annotations located in the folder [data](https://github.com/crhisto/CRC_organoids_and_fibroblasts_notebook/data/bulk_dataset/*) in the repository.
+```{bash bulk.data.download, eval=FALSE}
+#downloading the bulk RNA-seq dataset
+cd data/bulk_dataset/
+wget https://github.com/crhisto/CRC_organoids_and_fibroblasts_notebook/data/bulk_dataset/merged_rsem_counts_annotated.tsv.zip
+wget https://github.com/crhisto/CRC_organoids_and_fibroblasts_notebook/data/bulk_dataset/label_translation_samples.csv.zip
+unzip *
+```
+
+Importing the file with the count matrix and the 73 samples: 36 organoids and 37 fibroblasts
+```{r bulk.data.importing.files}
+path.data.bulk <- paste0(path.data, "bulk_dataset/")
+# We get all the columns for all tisue samples for all experiments.
+bulk.counting.matrix <- read.table(paste0(path.data.bulk, "merged_rsem_counts_annotated.tsv"), 
+                 header = TRUE,
+                 sep = "\t")
+
+#check the counting values for those genes.
+duplicated.gene_name <- bulk.counting.matrix  %>% dplyr::count(gene_name) %>% filter(n > 1) %>% arrange(desc(n))
+
+#first let's count the duplicated genes: 212 genes, 1866 rows
+nrow(duplicated.gene_name)
+sum(bulk.counting.matrix[bulk.counting.matrix$gene_name %in% duplicated.gene_name$gene_name, 3:148]) #3398219
+
+#Filter those values
+#We will do this one by one because we need each variable. The idea is to 
+`%!in%` = Negate(`%in%`)
+bulk.counting.matrix.filtered <- bulk.counting.matrix[bulk.counting.matrix$gene_name %!in% duplicated.gene_name$gene_name,]
+rownames(bulk.counting.matrix.filtered) <- bulk.counting.matrix.filtered$gene_name
+
+#Let's filter the tpm counts
+list.columns.samples <- colnames(bulk.counting.matrix.filtered)
+list.columns.samples.filtered <- list.columns.samples[grepl("_exp", list.columns.samples)]
+```
+
+In order to label correctly each sample, we got a file with the corrected names.
+```{r bulk.samples.relabeling}
+list.columns.samples <- colnames(bulk.counting.matrix.filtered)
+#deleting the two first names: gene_id and gene_name
+list.columns.samples.all <- list.columns.samples[3:length(list.columns.samples)]
+
+#let's add the three new samples for single cell data
+list.columns.samples.all <- c('[smc] Normal', '[smc] Tumor', 'Border', 'Normal', 'Tumor','[Qian] Normal', '[Qian] Tumor', list.columns.samples.all)
+
+#146 samples: 73 tpm, 73 row expression
+length(list.columns.samples.all)
+list.columns.samples.all.df <- data.frame(sample = list.columns.samples.all)
+
+
+#if we have to split the data manually. It is better to make a external file with the lab validation
+manual_inspection <- FALSE
+if(manual_inspection){
+  list.columns.samples.all.df$patient <- substr(list.columns.samples.all.df$sample, 4, 4)
+  list.columns.samples.all.df$replica <- substr(list.columns.samples.all.df$sample, 6, 6)
+  list.columns.samples.all.df$data_type <- str_sub(list.columns.samples.all.df$sample, -3)
+  list.columns.samples.all.df$tumor_organoids <- grepl("_O_", list.columns.samples.all.df$sample)
+  
+  paste(shQuote(sort(unique(list.columns.samples.all.df$sample))), collapse=", ")
+}else{
+  #lets import the file
+  bulk.colorectal.label.translation.samples <- read.table(paste0(path.data.bulk, "label_translation_samples.csv"), header = TRUE, sep = ";")
+  
+
+  #let's joint the data.
+  list.columns.samples.all.df <- list.columns.samples.all.df %>% inner_join(bulk.colorectal.label.translation.samples, by = "sample")
+  
+  #now I'm going to sort by the order column
+  list.columns.samples.all.df <- list.columns.samples.all.df[order(list.columns.samples.all.df$global_order, decreasing = FALSE),]
+}
+```
+
+Now we have to create the object with the bulk data to run the deconvolution.
+```{r bulk.data.creation}
+
+#create the matrix of counts with the samples or replicas that we selected.
+counts.colorectal <- Matrix(as.matrix(bulk.counting.matrix.filtered[,list.columns.samples.filtered]), sparse = TRUE)
+
+#create the eset final object
+fdata.colorectal <- rownames(counts.colorectal)
+pdata.colorectal <- cbind(subjects = colnames(counts.colorectal))
+eset.bulk.colorectal <- getESET(counts.colorectal, fdata = fdata.colorectal, pdata = pdata.colorectal)
+eset.bulk.colorectal
+```
+
+# 1. Deconvolutions using SMC dataset from Lee H. et al, 2020
+
+We used the SMC dataset of the publication, which is a ScRNA-seq of unsorted CRC single cells of 23 patients where 13 are from tumor samples and 10 from normal samples. The authors originally clustered 5 cell types (stromal, Myeloid, Mast, T, B, and Epithelial cells) and 4 consensus molecular subtypes (CMS1, CMS2, CMS3, and CMS4). After filtering just the Epithelial cells, we recovered 18,539 cells were 1.070 corresponded to Normal Epithelial cells with 5 sub-cell types (Stem-like/TA, Goblet cells, Intermediate, Mature Enterocytes type 1, and Mature Enterocytes type 2) and 17,469 tumor cells with four CMS clustering.
+
+## Single-Cell importing and analysis
+
+Download 1 set of files with Single Cell data corresponding to the paper: Lineage-dependent gene expression programs influence the immune landscape of colorectal cancer (https://pubmed.ncbi.nlm.nih.gov/32451460/): 
+```{bash Lee.download_files, eval = FALSE}
+cd data/sc_datasets/
+
+#downloading the scRNA-seq dataset No.1
+wget https://ftp.ncbi.nlm.nih.gov/geo/series/GSE132nnn/GSE132465/suppl/GSE132465_GEO_processed_CRC_10X_cell_annotation.txt.gz
+wget https://ftp.ncbi.nlm.nih.gov/geo/series/GSE132nnn/GSE132465/suppl/GSE132465_GEO_processed_CRC_10X_natural_log_TPM_matrix.txt.gz
+wget https://ftp.ncbi.nlm.nih.gov/geo/series/GSE132nnn/GSE132465/suppl/GSE132465_GEO_processed_CRC_10X_raw_UMI_count_matrix.txt.gz
+gzip -d GSE132465_GEO_processed_CRC_10X_cell_annotation.txt.gz
+gzip -d GSE132465_GEO_processed_CRC_10X_raw_UMI_count_matrix.txt.gz
+
+```
+
+Importing data for the single cell dataset and creation of the corresponding seurat objects.
+```{r smc.Lee.creating_seural_scRNA_seq_data_1}
+path.data.sc <- paste0(path.data, "sc_datasets/")
+
+matrix.smc <- fread(paste0(path.data.sc, "GSE132465_GEO_processed_CRC_10X_raw_UMI_count_matrix.txt"),
+                    sep = '\t', header = TRUE)
+
+matrix.smc.filter <- matrix.smc[,-1]
+matrix.smc.filter.matrix <- as.matrix(matrix.smc.filter)
+rownames(matrix.smc.filter.matrix) <- as.character(matrix.smc$Index)
+matrix.smc.filter.matrix.sparce <- Matrix(matrix.smc.filter.matrix, sparse = TRUE)
+
+#Creation of the Seurat object.
+seurat.smc <- CreateSeuratObject(counts = matrix.smc.filter.matrix.sparce, project = "smc")
+
+# We get all the columns for all tisue samples for all experiments.
+annotations.smc <- read.table(paste0(path.data.sc, "GSE132465_GEO_processed_CRC_10X_cell_annotation.txt"), 
+                 header = TRUE,
+                 sep = "\t")
+
+#We get the names of the cell types (clusters) to create the dataset
+paste(shQuote(sort(unique(annotations.smc$Patient))), collapse=", ")
+paste(shQuote(sort(unique(annotations.smc$Class))), collapse=", ")
+paste(shQuote(sort(unique(annotations.smc$Sample))), collapse=", ")
+paste(shQuote(sort(unique(annotations.smc$Cell_type))), collapse=", ")
+paste(shQuote(sort(unique(annotations.smc$Cell_subtype))), collapse=", ")
+
+#adding the normalized subclustering.
+cluster_list.smc <- data.frame(Cell_subtype = c('CMS1', 'CMS2', 'CMS3', 'CMS4',  'Stem-like/TA', 'Goblet cells', 'Intermediate', 'Mature Enterocytes type 1', 'Mature Enterocytes type 2', 'CD19+CD20+ B', 'CD4+ T cells', 'CD8+ T cells', 'cDC', 'Enteric glial cells', 'gamma delta T cells', 'IgA+ Plasma', 'IgG+ Plasma', 'Lymphatic ECs', 'Mast cells', 'Myofibroblasts', 'NK cells', 'Pericytes', 'Pro-inflammatory', 'Proliferating', 'Proliferative ECs', 'Regulatory T cells', 'Smooth muscle cells', 'SPP1+', 'Stalk-like ECs', 'Stromal 1', 'Stromal 2', 'Stromal 3', 'T follicular helper cells', 'T helper 17 cells', 'Tip-like ECs', 'Unknown'), cluster_normalized = paste0('cluster_', 1:36), cluster_order = as.numeric(c(1:36)))
+
+cluster_list.smc.Cell_type <- data.frame(Cell_type = c('Epithelial cells', 'Stromal cells', 'T cells', 'B cells', 'Mast cells', 'Myeloids'), cluster_normalized_Cell_type = paste0('cluster_', 1:6), cluster_order_Cell_type = as.numeric(c(1:6)))
+
+#We add the cluster normalized for avoiding problems with names and special characters
+annotations.smc <- annotations.smc %>% inner_join(cluster_list.smc, by = "Cell_subtype")
+annotations.smc <- annotations.smc %>% inner_join(cluster_list.smc.Cell_type, by = "Cell_type")
+
+#We add the information from the annotations to the seurat object
+seurat.smc@meta.data$Patient <- annotations.smc$Patient
+seurat.smc@meta.data$Class <- annotations.smc$Class
+seurat.smc@meta.data$Sample <- annotations.smc$Sample
+seurat.smc@meta.data$Cell_type <- annotations.smc$Cell_type
+seurat.smc@meta.data$Cell_subtype <- annotations.smc$Cell_subtype
+seurat.smc@meta.data$cluster_normalized <- annotations.smc$cluster_normalized
+seurat.smc@meta.data$cluster_normalized_Cell_type <- annotations.smc$cluster_normalized_Cell_type
+
+#Assign the identity
+Idents(seurat.smc) <- seurat.smc$Cell_type
+
+seurat.smc[["percent.mt"]] <- PercentageFeatureSet(seurat.smc, pattern = "^MT-")
+```
+
+Let's run the single cell pipeline analysis
+```{r smc.Lee.seurat.features.plot, fig.width=15, fig.height=18}
+
+plot.vln.seurat(seurat.smc, seurat.smc$Patient)
+plot.vln.seurat(seurat.smc, seurat.smc$Class)
+plot.vln.seurat(seurat.smc, seurat.smc$Sample)
+plot.vln.seurat(seurat.smc, seurat.smc$Cell_type)
+plot.vln.seurat(seurat.smc, seurat.smc$Cell_subtype)
+```
+
+```{r smc.Lee.seurat.normalize.data}
+
+seurat.smc <- NormalizeData(object = seurat.smc, normalization.method = "RC", scale.factor = 1e6)
+```
+
+```{r smc.Lee.seurat.variable.features}
+
+seurat.smc <- FindVariableFeatures(object = seurat.smc)
+```
+
+
+```{r smc.Lee.seurat.scale_data}
+#https://github.com/HenrikBengtsson/future
+plan()
+plan(multicore)
+
+seurat.smc <- ScaleData(object = seurat.smc, vars.to.regress = c("nCount_RNA"))
+
+plan(sequential)
+```
+
+
+Following the instructions of: #https://scrnaseq-course.cog.sanger.ac.uk/website/seurat-chapter.html. Before applying a PCA analysis, it has to run the scaleData function
+```{r smc.Lee.seurat.dimensionality_reduction_pca, fig.width=25, fig.height=12}
+
+#Approx enable us to compute the PCA with TruncatedSVD: Use truncated singular value decomposition to approximate PCA
+seurat.smc <- RunPCA(object = seurat.smc,  npcs = 100, verbose = TRUE, approx=TRUE)
+```
+
+```{r smc.Lee.seurat.visualize_pca, fig.width=25, fig.height=12}
+# Examine and visualize PCA results a few different ways
+DimPlot(object = seurat.smc, reduction = "pca") + theme(legend.position = 'top')
+```
+
+Check https://distill.pub/2016/misread-tsne/ for evaluating some parameters like perplexity.
+```{r smc.Lee.seurat.tsne}
+seurat.smc <- RunTSNE(object = seurat.smc, dims.use = 1:100, do.fast = TRUE)
+```
+
+Plots of the T-SNE representation with clusters and subclusters
+```{r Lee.seurat.plot_tsne, fig.width=25, fig.height=12}
+Idents(seurat.smc) <- seurat.smc$Cell_type
+DimPlot(object = seurat.smc, reduction = "tsne", label = T, pt.size=1) + theme(legend.position = 'right')
+
+Idents(seurat.smc) <- seurat.smc$Cell_subtype
+DimPlot(object = seurat.smc, reduction = "tsne", label = T, pt.size=1) + theme(legend.position = 'right')
+```
+
+UMAP representation of all the dataset
+Check https://umap-learn.readthedocs.io/en/latest/interactive_viz.html
+```{r, smc.Lee.umap, fig.width=25, fig.height=12}
+seurat.smc <- RunUMAP(seurat.smc, reduction = "pca", dims = 1:20)
+```
+
+UMAP representation with the subclusters
+```{r smc.Lee.seurat.metacluster, fig.width=25, fig.height=12}
+
+Idents(seurat.smc) <- seurat.smc$Cell_type
+DimPlot(seurat.smc, label = T, reduction = "umap", label.size = 5) + theme(legend.position = 'top')
+
+Idents(seurat.smc) <- seurat.smc$Cell_subtype
+DimPlot(seurat.smc, label = T, reduction = "umap", label.size = 5) + theme(legend.position = 'top')
+
+Idents(seurat.smc) <- seurat.smc$Cell_type
+DimPlot(seurat.smc, label = T, reduction = "umap", label.size = 5, split.by = "Class") + theme(legend.position = 'top')
+
+```
+
+
+### Single-cell data: Epithelial cells
+
+Now, let's analyse the data, just with epithelial cells.
+
+```{r smc.Lee.subset.epithelial}
+Idents(seurat.smc) <- seurat.smc$Cell_type
+seurat.smc.original <- subset(x = seurat.smc, cells = colnames(x = seurat.smc)[seurat.smc$Cell_type %in% c('Epithelial cells')])
+#18539 cells
+seurat.smc.epithelial <- subset(x = seurat.smc, cells = colnames(x = seurat.smc)[seurat.smc$Cell_type %in%  c('Epithelial cells')])
+
+#original
+DimPlot(seurat.smc.original, reduction = "umap") + theme(legend.position = 'top')
+
+#Running all the pipeline just in epithelial cells
+seurat.smc.epithelial <- ScaleData(object = seurat.smc.epithelial, vars.to.regress = c("nCount_RNA"))
+seurat.smc.epithelial <- RunPCA(object = seurat.smc.epithelial,  npcs = 100, verbose = TRUE, approx=TRUE)
+#, n.neighbors = 40, min.dist = 0.4
+seurat.smc.epithelial <- RunUMAP(seurat.smc.epithelial, reduction = "pca", dims = 1:23)
+```
+
+```{r smc.Lee.seurat.plot.epithelial.cells.umap, fig.width=25, fig.height=12}
+
+Idents(seurat.smc.epithelial) <- seurat.smc.epithelial$Cell_subtype
+DimPlot(seurat.smc.epithelial, label = T, reduction = "umap", label.size = 5) + theme(legend.position = 'top')
+
+Idents(seurat.smc.epithelial) <- seurat.smc.epithelial$Cell_subtype
+DimPlot(seurat.smc.epithelial, label = T, reduction = "umap", label.size = 5, split.by = "Class", repel = TRUE) + theme(legend.position = 'top')
+```
+
+
+### Single-cell data: Normal Epithelial cells
+Now, let's analyse the data, just with NORMAL epithelial cells.
+```{r smc.Lee.subset.normal.epithelial}
+#1070 cells
+seurat.smc.epithelial.normal <- subset(x = seurat.smc.epithelial, cells = colnames(x = seurat.smc.epithelial)[seurat.smc.epithelial$Class %in%  c('Normal')])
+
+#Running all the pipeline just in NORMAL epithelial cells
+seurat.smc.epithelial.normal <- ScaleData(object = seurat.smc.epithelial.normal, vars.to.regress = c("nCount_RNA"))
+seurat.smc.epithelial.normal <- RunPCA(object = seurat.smc.epithelial.normal,  npcs = 100, verbose = TRUE, approx=TRUE)
+seurat.smc.epithelial.normal <- RunUMAP(seurat.smc.epithelial.normal, reduction = "pca", dims = 1:100)
+```
+
+CRC was classified into four subtypes with distinct molecular and biological characteristics: CMS1 (microsatellite instability immune), CMS2 (canonical), CMS3 (metabolic), and CMS4 (mesenchymal) (https://onlinelibrary.wiley.com/doi/full/10.1002/ags3.12362)
+```{r smc.Lee.seurat.plot.normal.epithelial.cells.umap, fig.width=15, fig.height=10}
+
+Idents(seurat.smc.epithelial.normal) <- seurat.smc.epithelial.normal$Cell_subtype
+
+#"#ff205b", "#06cd6c", "#019bde", "#af5aba",
+color.palette.smc.Lee.umap.plot.normal.epithelial <- c("#ffc51f", "#f28622", "#a1b1ba", "#a7761d", "#ff7fa7")
+smc.Lee.umap.plot.normal.epithelial.cells <- DimPlot(seurat.smc.epithelial.normal, label = T, pt.size = 4, label.size = 6, reduction = "umap", cols = color.palette.smc.Lee.umap.plot.normal.epithelial) + theme(legend.position = 'right')
+print(smc.Lee.umap.plot.normal.epithelial.cells)
+```
+
+## Deconvolution pipeline: Epithelial Cells {.tabset}
+
+Creation of object with the scRNA-seq data for the deconvolution
+```{r smc.Lee.epithelial.deconvolution.simulation.preparing.dataset}
+
+#Use the function to create the sparse eset object
+counts.smc.epithelial <- create_count_matrix(seurat.smc.epithelial)
+eset.smc.epithelial.sparse <- create_sparse_eset_object_smc_kul3(counts.smc.epithelial, seurat.smc.epithelial)
+unique(eset.smc.epithelial.sparse$cell_type)
+unique(eset.smc.epithelial.sparse$class)
+unique(eset.smc.epithelial.sparse$cell_subtype)
+unique(eset.smc.epithelial.sparse$cluster_normalized)
+head(eset.smc.epithelial.sparse)
+
+```
+
+Creation of object for simulate bulk RNA-seq data from the scRNA-seq data. 
+```{r smc.Lee.epithelial.deconvolution.object.simulation.bulk.scrna}
+
+## (1) using all single cells
+start_time <- Sys.time()
+pseudo.smc.epithelial <- generateBulk_allcells(eset.smc.epithelial.sparse, ct.varname = "cluster_normalized", sample = "class", ct.sub = NULL)
+end_time <- Sys.time()
+end_time - start_time
+
+## (2) using random proportions of single cells
+start_time <- Sys.time()
+pseudo.rand.smc.epithelial <- generateBulk_norep(eset.smc.epithelial.sparse, ct.varname = "cluster_normalized", sample = "class", ct.sub = unique(eset.smc.epithelial.sparse$cluster_normalized), nbulk = 12)
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+### Deconvolution simulation {.tabset}
+
+We will simulate the bulk data of Normal and Tumor samples where we can find 9 cell subtypes, however, in the tumor samples there are just the first 4 cell types present and the rest are just present in the normal samples. 
+This part corresponds to the execution of the deconvolution with the simulated bulk database on the single-cell dataset. Given the Boostraping sampling, there is variability across different runs, however with a high boostrap.number, specifically in this case with 100, both the number of marker genes, the Pearson correlation, and the deviance have low variation. Be aware of the configuration of the machine that you are using for executing the deconvolution. In this case for each thread, you may need a maximum of 10 GB in RAM.
+```{r smc.Lee.deconvolution.simulation.epithelial.pseudo.normal}
+
+c_epithelial.fl.sub <- c('Subcluster 1', 'Subcluster 2', 'Subcluster 3')
+c_epithelial.sub <- paste0('cluster_',seq(1, 9))
+
+
+add_metacluster.epithelial <- function (sc.eset){
+    
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(1,2,3,4))] <-  "Subcluster 1"
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(5,6,7))] <-  "Subcluster 2"
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(8,9))] <-  "Subcluster 3"
+
+  sc.eset
+}
+
+start_time <- Sys.time()
+
+#add the metacluster information
+eset.smc.epithelial.sparse.metacluster <- add_metacluster.epithelial(eset.smc.epithelial.sparse)
+
+#run the tree guided with subclusters. 
+SCDC.epithelial.tree_guided.qc.metacluster.parallelized <- SCDC_prop_subcl_marker(bulk.eset = pseudo.smc.epithelial$pseudo_eset ,
+                                                                                               sc.eset = eset.smc.epithelial.sparse.metacluster,
+                                                                                               ct.varname = "cluster_normalized", fl.varname = "metacluster",
+                                                                                               sample = "class",
+                                                                                               ct.sub = c_epithelial.sub,
+                                                                                               ct.fl.sub = c_epithelial.fl.sub,
+                                                                                               select.marker = TRUE,
+                                                                                               truep = pseudo.smc.epithelial$truep,
+                                                                                               parallelize = T, core_number = 3,
+                                                                                               marker_gene_strategy = 'boostrap_outliers',
+                                                                                               iteration.minimun_number_markers = 28,
+                                                                                               iteration.use_maximum = TRUE,
+                                                                                               iteration.maximo_genes = 35,
+                                                                                               iteration.use_final_foldchange = TRUE,
+                                                                                               epsilon = 0.001,
+                                                                                               weight.basis = F,
+                                                                                               bootstrap.number = 100,
+                                                                                               bootstrap.sample_size = 4,
+                                                                                               additional_genes = NULL
+                                                                                          )
+
+SCDC.epithelial.tree_guided.qc.metacluster.parallelized$prop.est
+
+#initial r = 1.0
+SCDC.epithelial.tree_guided.qc.metacluster.parallelized$peval$evals.table
+SCDC.epithelial.tree_guided.qc.metacluster.parallelized$peval$pearson.sample.table
+
+# 1.344058 hours
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+In the section, we run the deconvolution but with a pseudo bulk data that simulate 12 Tumor and normal replicas.
+```{r smc.Lee.deconvolution.simulation.epithelial.pseudo.replicas}
+
+c_epithelial.fl.sub <- c('Subcluster 1', 'Subcluster 2', 'Subcluster 3')
+c_epithelial.sub <- paste0('cluster_',seq(1, 9))
+
+add_metacluster.epithelial <- function (sc.eset){
+    
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(1,2,3,4))] <-  "Subcluster 1"
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(5,6,7))] <-  "Subcluster 2"
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(8,9))] <-  "Subcluster 3"
+
+  sc.eset
+}
+
+start_time <- Sys.time()
+
+#add the metacluster information
+eset.smc.epithelial.sparse.metacluster <- add_metacluster.epithelial(eset.smc.epithelial.sparse)
+
+#run the tree guided with subclusters. 
+SCDC.epithelial.tree_guided.qc.metacluster.parallelized.rand <- SCDC_prop_subcl_marker(bulk.eset = pseudo.rand.smc.epithelial$pseudo_eset ,
+                                                                                               sc.eset = eset.smc.epithelial.sparse.metacluster,
+                                                                                               ct.varname = "cluster_normalized", fl.varname = "metacluster",
+                                                                                               sample = "class",
+                                                                                               ct.sub = c_epithelial.sub,
+                                                                                               ct.fl.sub = c_epithelial.fl.sub,
+                                                                                               select.marker = TRUE,
+                                                                                               truep = pseudo.rand.smc.epithelial$true_p,
+                                                                                               parallelize = T, core_number = 3,
+                                                                                               marker_gene_strategy = 'boostrap_outliers',
+                                                                                               iteration.minimun_number_markers = 28,
+                                                                                               iteration.use_maximum = TRUE,
+                                                                                               iteration.maximo_genes = 35,
+                                                                                               iteration.use_final_foldchange = TRUE,
+                                                                                               epsilon = 0.001,
+                                                                                               weight.basis = F,
+                                                                                               bootstrap.number = 100,
+                                                                                               bootstrap.sample_size = 4,
+                                                                                               additional_genes = NULL
+                                                                                          )
+
+SCDC.epithelial.tree_guided.qc.metacluster.parallelized.rand$prop.est
+
+#initial r = 0.9949
+SCDC.epithelial.tree_guided.qc.metacluster.parallelized.rand$peval$evals.table
+SCDC.epithelial.tree_guided.qc.metacluster.parallelized.rand$peval$pearson.sample.table
+
+# 1.27977 hours
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+
+### Deconvolution of the actual bulk data {.tabset}
+
+Execution of the deconvolution with the actual bulk data, using the optimized parameters found in the simulation.
+```{r smc.Lee.deconvolution.actual.data.epithelial.sc}
+
+c_epithelial.fl.sub <- c('Subcluster 1', 'Subcluster 2', 'Subcluster 3')
+c_epithelial.sub <- paste0('cluster_',seq(1, 9))
+
+add_metacluster.epithelial <- function (sc.eset){
+    
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(1,2,3,4))] <-  "Subcluster 1"
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(5,6,7))] <-  "Subcluster 2"
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(8,9))] <-  "Subcluster 3"
+
+  sc.eset
+}
+
+start_time <- Sys.time()
+
+#add the metacluster information
+eset.smc.epithelial.sparse.metacluster <- add_metacluster.epithelial(eset.smc.epithelial.sparse)
+
+#run the tree guided with subclusters. 
+SCDC.epithelial.tree_guided.qc.metacluster.parallelized.actual.data <- SCDC_prop_subcl_marker(bulk.eset = eset.bulk.colorectal,
+                                                                                               sc.eset = eset.smc.epithelial.sparse.metacluster,
+                                                                                               ct.varname = "cluster_normalized", fl.varname = "metacluster",
+                                                                                               sample = "class",
+                                                                                               ct.sub = c_epithelial.sub,
+                                                                                               ct.fl.sub = c_epithelial.fl.sub,
+                                                                                               select.marker = TRUE,
+                                                                                               parallelize = T, core_number = 5,
+                                                                                               marker_gene_strategy = 'boostrap_outliers',
+                                                                                               iteration.minimun_number_markers = 28,
+                                                                                               iteration.use_maximum = TRUE,
+                                                                                               iteration.maximo_genes = 35,
+                                                                                               iteration.use_final_foldchange = TRUE,
+                                                                                               epsilon = 0.001,
+                                                                                               weight.basis = F,
+                                                                                               bootstrap.number = 100,
+                                                                                               bootstrap.sample_size = 4,
+                                                                                               additional_genes = NULL
+                                                                                          )
+
+SCDC.epithelial.tree_guided.qc.metacluster.parallelized.actual.data$prop.est
+
+# 1.842845 hours
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+
+## Result of the deconvolution: Proportions
+
+Estimated proportions of the bulk data calculated for the deconvolution library for each replica/Sample, including actual proportions of the single cell data that was used as reference.
+```{r smc.Lee.deconvolution.plot.proportions.all, fig.width=12, fig.height=14}
+data.plot.proportions <- as.data.frame(SCDC.epithelial.tree_guided.qc.metacluster.parallelized.actual.data$prop.est)
+
+
+#Adding the single cell proportions for normal and tumor to compare the actual proportions.
+smc.data.plot.actual.proportions.df <- as.data.frame.matrix(pseudo.smc.epithelial$truep)
+rownames(smc.data.plot.actual.proportions.df) <- c('[smc] Normal', '[smc] Tumor')
+#We filtered the columns with the one in the deconvolution proportions
+smc.data.plot.actual.proportions.df <- smc.data.plot.actual.proportions.df[, colnames(data.plot.proportions)]
+data.plot.proportions <- rbind(smc.data.plot.actual.proportions.df, data.plot.proportions)
+
+
+data.plot.proportions <- cbind(sample = rownames(data.plot.proportions),
+                               data.plot.proportions)
+data.plot.proportions.df.melt <- data.plot.proportions %>% gather(cluster_normalized, proportion, 2:10)
+
+#adding the original cell type name
+data.plot.proportions.df.melt <- data.plot.proportions.df.melt %>% inner_join(cluster_list.smc, by = "cluster_normalized")
+#adding labels from the sample pattern name
+data.plot.proportions.df.melt <- data.plot.proportions.df.melt %>% inner_join(list.columns.samples.all.df, by = "sample")
+
+#different plots depend on the sorting
+
+#1.Adding a order for default
+list.columns.samples.all.df <- list.columns.samples.all.df[  with(list.columns.samples.all.df, order(global_order)),]
+proportions.deconvolution.epithelial.plot.all.default <- smc.plot.proportions.sorting(title = 'Deconvolution epithelial cells: 73 samples (default sorting) - smc', data.plot.proportions.df.melt)
+print(proportions.deconvolution.epithelial.plot.all.default)
+
+#2.Adding a order for the samples for patients
+list.columns.samples.all.df <- list.columns.samples.all.df[  with(list.columns.samples.all.df, order(type.order, patient_order)),]
+proportions.deconvolution.epithelial.plot.all.sorting.type.patient <- plot.proportions.sorting(title = 'Deconvolution epithelial cells: 73 samples (type-patient sorting) - smc', data.plot.proportions.df.melt)
+print(proportions.deconvolution.epithelial.plot.all.sorting.type.patient)
+
+#3.sorting for patients and sampels
+list.columns.samples.all.df <- list.columns.samples.all.df[  with(list.columns.samples.all.df, order(patient, type.order)),]
+proportions.deconvolution.epithelial.plot.all.sorting.patient.type <- plot.proportions.sorting(title = 'Deconvolution epithelial cells: 73 samples (patient-type sorting) - smc', data.plot.proportions.df.melt)
+print(proportions.deconvolution.epithelial.plot.all.sorting.patient.type)
+
+#3.1.sorting for patients and sampels: just organoids
+list.columns.samples.all.df <- list.columns.samples.all.df[ with(list.columns.samples.all.df, order(patient, type.order)),]
+proportions.deconvolution.epithelial.plot.all.sorting.patient.type.organoids <- plot.proportions.sorting(title = 'Deconvolution epithelial cells: 36 ORGANOIDS samples (patient-type sorting) - smc', data.plot.proportions.df.melt[data.plot.proportions.df.melt$global_type == 'organoids',])
+print(proportions.deconvolution.epithelial.plot.all.sorting.patient.type.organoids)
+```
+
+## Result of the deconvolution: Marker genes
+
+Finally, we created headmaps using the normalized expression data over the marker genes recovered for the deconvolution.
+```{r smc.Lee.deconvolution.plot.heatmap.samples.vs.markers.improved.organoids.specific.normalization, fig.width=12, fig.height=14}
+
+#markers for the deconvolution
+smc.Lee.deconvolution.epithelial.markers <- c('CCL20', 'CXCL2', 'CXCL3', 'PHGR1', 'RPL21', 'RPL7', 'RPL8', 'RPS24', 'RPS3', 'RPS4X', 'RPS20', 'RPL23', 'ID1', 'RPS21', 'GGH', 'KRT20', 'CST3', 'EREG', 'XXbac-BPG32J3.19', 'STRAP', 'EEF1D', 'DPEP1', 'SPINK1', 'RPS7', 'HULC', 'CD9', 'C8orf33', 'IFITM3', 'EIF3E', 'KRT23', 'ID3', 'CYCS', 'CKS2', 'PERP', 'EBP', 'REG4', 'SPINK4', 'SERPINA1', 'TACSTD2', 'FCGBP', 'IL32', 'CEACAM6', 'KLK12', 'AQP3', 'ANXA1', 'NDUFA4L2', 'AQP5', 'RAMP1', 'MUC1', 'LINC00261', 'PRAP1', 'NPDC1', 'NMU', 'PLIN2', 'PLAC8', 'MUC5AC', 'AGR3', 'CREB3L1', 'RAP1GAP', 'ST3GAL4', 'CD70', 'ETV1', 'COMMD6', 'PLA2G16', 'GNA15', 'RP11-469H8.6', 'CRIP2', 'RP11-115D19.1', 'RSPO2', 'IFI6', 'SPRR3', 'IGFBP6', 'KRT6A', 'CCL26', 'MUC6', 'BST2', 'SOCS2', 'PMP22', 'A2ML1', 'COL6A1', 'CALB1', 'CD109', 'SMOC1', 'EGFL7', 'NXPH4', 'RP11-297P16.4', 'TNNT1', 'IFI44', 'ULBP2', 'PIWIL1', 'CSRP2', 'LINC01615', 'MX1', 'NPB', 'GPX8', 'TGFB1', 'TRIM7', 'HPSE', 'ZNF385A', 'XAF1', 'WNT7B', 'USF1', 'KLC3', 'AFAP1-AS1', 'SLFN11', 'CLEC18A', 'MMP7', 'KRT6B', 'IFIT1', 'RBP1', 'CCDC80', 'CD177', 'ITLN1', 'CLCA1', 'REP15', 'TPSG1', 'BEST2', 'ENTPD8', 'SCGN', 'VSIG2', 'SCGB2A1', 'LYPD8', 'INSM1', 'PSTPIP1', 'HRASLS2', 'GSN', 'MS4A8', 'TBX10', 'MB', 'MTRNR2L12', 'RNASE1', 'GDPD3', 'CRYBA2', 'IGHM', 'ANKRD36C', 'SCG5', 'KLK1', 'TFF1', 'ANXA13', 'SLPI', 'ST6GALNAC1', 'CA1', 'CA2', 'IGHA2', 'HMGCS2', 'MT1M', 'ADH1C', 'SLC28A2', 'CHP2', 'UGT2A3', 'GPT', 'CPM', 'NXPE1', 'EDIL3', 'PTGDR', 'ADAMDEC1', 'SCN9A', 'JCHAIN', 'NXPE4', 'CWH43', 'B3GNT7', 'LGALS2', 'CTSE', 'SPIB', 'SLC4A4', 'HOXD1', 'GUCA2B', 'UGT2B17', 'LEFTY1', 'CA7', 'IGHA1', 'POLR2A', 'C8orf4', 'ZG16', 'RP11-357H14.17', 'SELENBP1', 'SNHG12', 'IMPDH2', 'MGST1', 'NDUFA13', 'PIGR', 'PCSK1N', 'AQP8', 'CDKN2B-AS1', 'TMIGD1', 'CA4', 'MS4A12', 'CLCA4', 'SULT1A2', 'SLC51B', 'HSD17B2', 'CLDN23', 'SEPP1', 'GUCA2A', 'C2orf88', 'PKIB', 'PLA2G10', 'SLC26A3', 'CEACAM7', 'FABP1', 'CEACAM1', 'IFI27', 'PI3', 'CDA', 'TRIM31', 'ASS1', 'HIST1H1C', 'OTOP2', 'MYOM1', 'OTOP3', 'MT1H', 'BEST4', 'SAMD9', 'HRCT1', 'AOC1', 'MTRNR2L8', 'NEURL1', 'ST6GALNAC6', 'ANKRD28', 'MT1G', 'MT2A', 'MT1E', 'SRI', 'MSLN', 'FXYD3', 'PPDPF', 'MT1X')
+
+#Checking markers of the publications against the one recovered for the deconvolution. In overal between 1% and 2%.
+smc.markers.publication.vs.current.instance <- intersect(rownames(SCDC.epithelial.tree_guided.qc.metacluster.parallelized.actual.data$basis.mvw), smc.Lee.deconvolution.epithelial.markers)
+paste0('Markers in the publication: ', length(smc.Lee.deconvolution.epithelial.markers), '. Markers shared with the current instance: ', length(smc.markers.publication.vs.current.instance), '. Variation: ', round((1-(length(smc.markers.publication.vs.current.instance)/length(smc.Lee.deconvolution.epithelial.markers))), 3)*10, '%')
+
+#bulk data with just the markers.
+smc.Lee.epithelial.markers.expression <- as.matrix(eset.bulk.colorectal@assayData$exprs[rownames(eset.bulk.colorectal@assayData$exprs) %in% smc.Lee.deconvolution.epithelial.markers,list.columns.samples.all.df[list.columns.samples.all.df$global_type == "organoids" & list.columns.samples.all.df$sample %!in% c('Border', 'Tumor', 'Normal', '[Qian] Normal', '[Qian] Tumor', '[smc] Normal', '[smc] Tumor'),]$sample])
+
+#Function to create a Z-Score of the dataset and normalized it.
+cal_z_score <- function(x){
+  (x - mean(x)) / sd(x)
+}
+ 
+smc.Lee.epithelial.markers.expression_norm <- t(apply(smc.Lee.epithelial.markers.expression, 1, cal_z_score))
+#Delete rows witn NA values, due to zero values in the expression matrix
+smc.Lee.epithelial.markers.expression_norm <- na.omit(smc.Lee.epithelial.markers.expression_norm)
+
+
+#annotation for columns
+list.columns.samples.all.df.filtered.smc <- list.columns.samples.all.df[list.columns.samples.all.df$global_type == "organoids" & list.columns.samples.all.df$sample %!in% c('Border', 'Tumor', 'Normal', '[Qian] Normal', '[Qian] Tumor', '[smc] Normal', '[smc] Tumor'),]
+list.columns.samples.all.df.filtered.smc <- list.columns.samples.all.df.filtered.smc[  with(list.columns.samples.all.df.filtered.smc, order(type.order, patient_order)),]
+
+#Now we will create the top annotation with the organoids type
+top.annotation.samples.type.smc <- data.frame(sample = list.columns.samples.all.df.filtered.smc$sample, sample.type = list.columns.samples.all.df.filtered.smc$type, number = seq(1:36))
+rownames(list.columns.samples.all.df.filtered.smc) <- list.columns.samples.all.df.filtered.smc$sample
+
+sample.type <- data.frame(Condition = list.columns.samples.all.df.filtered.smc$type, 
+                          Patient = list.columns.samples.all.df.filtered.smc$patient)
+row.names(sample.type) <- list.columns.samples.all.df.filtered.smc$sample
+sample.type$Condition <- factor(sample.type$Condition, levels = c("O_min", "O_enas", "O_caf", "O_nf", "caf_O", "nf_O", "caf", "nf"))
+sample.type$Patient <- factor(sample.type$Patient, levels = c("1", "2", "3"))
+       
+
+#reorder the matrix by the annotation order
+smc.Lee.epithelial.markers.expression_norm <- smc.Lee.epithelial.markers.expression_norm[,rownames(sample.type)]
+
+color.palette <- c("#fed976", "#225ea8", "#f768a1", "#42ab5d",
+                     "#d39200", "#db7fb4", "#a58aff", "#fb61d7", "#ce5445")
+
+#annotation colors
+annotation.colors <-list(Condition=c(O_min="#fed976", O_enas="#225ea8", O_caf="#f768a1", O_nf="#42ab5d", caf_O="#996B00", nf_O="#C975A6", caf="#a58aff", nf="#fb61d7"), Patient=c('1'="#1b9e77", '2'="#d95f02", '3'="#7570b3"))
+
+# create heatmap using pheatmap
+smc.heatmap.advanced.condition.organoids.specific.norm <- pheatmap(smc.Lee.epithelial.markers.expression_norm,
+         main="Expr. samples vs marker genes - Deconvolution epithelial - Order Condition - Organoids - Spec NORM - smc",
+         cluster_cols = FALSE,
+         show_rownames = FALSE,
+         fontsize_col = 8,
+         annotation_col = sample.type,
+         annotation_colors = annotation.colors,
+         gaps_col = c(9,18,27))
+print(smc.heatmap.advanced.condition.organoids.specific.norm)
+
+smc.heatmap.advanced.condition.organoids.specific.norm.genes <- pheatmap(smc.Lee.epithelial.markers.expression_norm,
+         main="Expr. samples vs marker genes - Deconvolution epithelial - Order Condition - Organoids - Spec NORM - smc",
+         cluster_cols = FALSE,
+         show_rownames = TRUE,
+         fontsize_col = 8,
+         fontsize_row = 4,
+         annotation_col = sample.type,
+         annotation_colors = annotation.colors,
+         gaps_col = c(9,18,27))
+print(smc.heatmap.advanced.condition.organoids.specific.norm.genes)
+
+#reorder the matrix by the annotation order
+sample.type <- sample.type[with(sample.type, order(Patient)),]
+smc.Lee.epithelial.markers.expression_norm <- smc.Lee.epithelial.markers.expression_norm[,rownames(sample.type)]
+
+smc.heatmap.advanced.patient.organoids.specific.norm <- pheatmap(smc.Lee.epithelial.markers.expression_norm,
+         main="Expr. samples vs marker genes - Deconvolution epithelial - Order Patient - Organoids - Spec NORM - smc",
+         cluster_cols = FALSE,
+         show_rownames = FALSE,
+         fontsize_col = 8,
+         annotation_col = sample.type,
+         annotation_colors = annotation.colors,
+         gaps_col = c(12,24))
+print(smc.heatmap.advanced.patient.organoids.specific.norm)
+
+smc.heatmap.advanced.patient.organoids.specific.norm.genes <- pheatmap(smc.Lee.epithelial.markers.expression_norm,
+         main="Expr. samples vs marker genes - Deconvolution epithelial - Order Patient - Organoids - Spec NORM - smc",
+         cluster_cols = FALSE,
+         show_rownames = TRUE,
+         fontsize_col = 8,
+         fontsize_row = 4,
+         annotation_col = sample.type,
+         annotation_colors = annotation.colors,
+         gaps_col = c(12,24))
+print(smc.heatmap.advanced.patient.organoids.specific.norm.genes)
+```
+
+
+# 2. Deconvolutions using Qian dataset from Qian J. et al, 2020
+
+The paper has a complete dataset and profile analysis of CRC colorectal cancer from 7 patients, 14 normal tissues, and 7 with cancer. The study includes 9 cell types clustered (Epithelial, Fibroblast, B_cell, Cancer, Endothelial, Enteric glia, Mast cells, Myeloid, T cell). After filtering, we retrieved 4 cell types: Epithelial, Fibroblast, Cancer, Endothelial defined by 44,684 cells were 14,058 were normal epithelial cells with 5 cell types and 30,626 tumor cells.
+
+## Single-Cell importing and analysis
+
+### Downloading the scRNA-seq dataset
+
+Download 1 set of files with Single Cell data corresponding to the paper: A pan-cancer blueprint of the heterogeneous tumor microenvironment revealed by single-cell profiling (https://doi.org/10.1038/s41422-020-0355-0). It has to be done manually from https://lambrechtslab.sites.vib.be/en/pan-cancer-blueprint-tumour-microenvironment-0 since that needs a login process. There are two files that need to be downloaded into de folder data/sc_datasets/:
+1. Colorectal cancer - Counts Matrix: 2098-Colorectalcancer_counts.tar.gz
+2. Colorectal cancer - Metadata: 2099-Colorectalcancer_metadata.csv.gz
+```{bash Qian.single.cell.download, eval = FALSE}
+cd data/sc_datasets/
+tar -xf 2098-Colorectalcancer_counts.tar.gz
+gzip -d 2099-Colorectalcancer_metadata.csv.gz
+```
+
+Importing data for the single cell dataset and creation of the corresponding seurat objects.
+```{r creating_seural_scRNA_seq_data.Qian}
+path.data.sc.Qian <- paste0(path.data, "sc_datasets/")
+
+matrix.Qian <- Seurat::Read10X(paste0(path.data, "sc_datasets/export/CRC_counts/")) #44684
+seurat.Qian <- CreateSeuratObject(counts = matrix.Qian, project = "Qian")
+
+# We get all the columns for all tisue samples for all experiments.
+annotations.Qian <- read.table(paste0(path.data.sc.Qian, "2099-Colorectalcancer_metadata.csv"), 
+                 header = TRUE,
+                 sep = ",")
+levels.CellType.Qian <- c('Epithelial', 'Fibroblast', 'B_cell', 'Cancer', 'Endothelial', 'Enteric_glia', 'Mast_cell', 'Myeloid', 'T_cell')
+annotations.Qian$CellType <- factor(annotations.Qian$CellType, levels = c(levels.CellType.Qian, 'EC'))
+
+
+#We get the names of the cell types (clusters) to create the dataset
+paste(shQuote(sort(unique(annotations.Qian$CellFromTumor))), collapse=", ")
+paste(shQuote(sort(unique(annotations.Qian$TumorType))), collapse=", ")
+paste(shQuote(sort(unique(annotations.Qian$TumorSite))), collapse=", ")
+paste(shQuote(sort(unique(annotations.Qian$CellType))), collapse=", ")
+
+
+#adding the normalized subclustering. We replaced EC by Endothelial 
+cluster_list.Qian <- data.frame(CellType = c('Epithelial', 'Fibroblast', 'B_cell', 'Cancer', 'Endothelial', 'Enteric_glia', 'Mast_cell', 'Myeloid', 'T_cell'), cluster_normalized = paste0('cluster_', 1:9), cluster_order = as.numeric(c(1:9)))
+
+#We add the cluster normalized for avoiding problems with names and special characters
+annotations.Qian[annotations.Qian$CellType == 'EC',]$CellType <- 'Endothelial'
+annotations.Qian$CellType <- factor(annotations.Qian$CellType, levels = levels.CellType.Qian)
+annotations.Qian <- annotations.Qian %>% inner_join(cluster_list.Qian, by = "CellType")
+
+
+#We add the information from the annotations to the seurat object
+seurat.Qian@meta.data$CellFromTumor <- annotations.Qian$CellFromTumor
+seurat.Qian@meta.data$PatientNumber <- annotations.Qian$PatientNumber
+seurat.Qian@meta.data$TumorType <- annotations.Qian$TumorType
+seurat.Qian@meta.data$TumorSite <- annotations.Qian$TumorSite
+seurat.Qian@meta.data$CellType <- annotations.Qian$CellType
+seurat.Qian@meta.data$cluster_normalized <- annotations.Qian$cluster_normalized
+seurat.Qian@meta.data$cluster_order <- annotations.Qian$cluster_order
+
+#Assign the identity
+Idents(seurat.Qian) <- seurat.Qian$CellType
+
+seurat.Qian[["percent.mt"]] <- PercentageFeatureSet(seurat.Qian, pattern = "^MT-")
+```
+
+```{r Qian.vplot, fig.width=15, fig.height=18}
+Idents(seurat.Qian) <- seurat.Qian$CellType
+
+plot.Qian.all <- VlnPlot(seurat.Qian, features = c("nFeature_RNA", "nCount_RNA", 'percent.mt'), ncol = 1)   + theme(legend.position = 'top')
+print(plot.Qian.all)
+
+Idents(seurat.Qian) <- seurat.Qian$CellFromTumor
+plot.Qian.CellFromTumor <- VlnPlot(seurat.Qian, features = c("nFeature_RNA", "nCount_RNA", 'percent.mt'), ncol = 1)   + theme(legend.position = 'top')
+print(plot.Qian.CellFromTumor)
+```
+
+```{r Qian.seurat.normalize.data}
+
+seurat.Qian <- NormalizeData(object = seurat.Qian, normalization.method = "RC", scale.factor = 1e6)
+```
+
+```{r Qian.seurat.variable.features}
+
+seurat.Qian <- FindVariableFeatures(object = seurat.Qian)
+```
+
+```{r Qian.seurat.scale_data}
+#https://github.com/HenrikBengtsson/future
+plan()
+plan(multicore)
+
+seurat.Qian <- ScaleData(object = seurat.Qian, vars.to.regress = c("nCount_RNA"))
+
+plan(sequential)
+```
+
+
+Following the instructions of: #https://scrnaseq-course.cog.sanger.ac.uk/website/seurat-chapter.html. Before applying a PCA analysis, it has to run the scaleData function
+```{r Qian.seurat.dimensionality_reduction_pca, fig.width=25, fig.height=12}
+
+#Approx enable us to compute the PCA with TruncatedSVD: Use truncated singular value decomposition to approximate PCA
+seurat.Qian <- RunPCA(object = seurat.Qian,  npcs = 100, verbose = TRUE, approx=TRUE)
+```
+
+```{r Qian.seurat.visualize_pca, fig.width=25, fig.height=12}
+# Examine and visualize PCA results a few different ways
+DimPlot(object = seurat.Qian, reduction = "pca") + theme(legend.position = 'top')
+```
+
+Check https://distill.pub/2016/misread-tsne/ for evaluating some parameters like perplexity.
+```{r Qian.seurat.tsne}
+
+seurat.Qian <- RunTSNE(object = seurat.Qian, dims.use = 1:100, do.fast = TRUE)
+```
+
+Plots of the tsne representation with clusters and subclusters
+```{r Qian.seurat.plot_tsne, fig.width=25, fig.height=12}
+Idents(seurat.Qian) <- seurat.Qian$CellType
+DimPlot(object = seurat.Qian, reduction = "tsne", label = T, pt.size=1) + theme(legend.position = 'right')
+
+Idents(seurat.Qian) <- seurat.Qian$CellFromTumor
+DimPlot(object = seurat.Qian, reduction = "tsne", label = T, pt.size=1) + theme(legend.position = 'right')
+```
+
+UMAP representation of the whole dataset
+Check https://umap-learn.readthedocs.io/en/latest/interactive_viz.html
+```{r Qian.umap, fig.width=25, fig.height=12}
+seurat.Qian <- RunUMAP(seurat.Qian, reduction = "pca", dims = 1:20)
+```
+
+UMAP representation with the subclusters
+```{r Qian.seurat.metacluster, fig.width=25, fig.height=12}
+
+Idents(seurat.Qian) <- seurat.Qian$CellType
+DimPlot(seurat.Qian, label = T, reduction = "umap", label.size = 5) + theme(legend.position = 'top')
+
+Idents(seurat.Qian) <- seurat.Qian$cluster_normalized
+DimPlot(seurat.Qian, label = T, reduction = "umap", label.size = 5) + theme(legend.position = 'top')
+
+Idents(seurat.Qian) <- seurat.Qian$CellFromTumor
+DimPlot(seurat.Qian, label = T, reduction = "umap", label.size = 5) + theme(legend.position = 'top')
+
+Idents(seurat.Qian) <- seurat.Qian$CellType
+DimPlot(seurat.Qian, label = T, reduction = "umap", label.size = 5, split.by = "CellFromTumor") + theme(legend.position = 'top')
+```
+
+## Deconvolution pipeline {.tabset}
+
+Creation of object with the scRNA-seq data for the deconvolution
+```{r Qian.deconvolution.simulation.preparing.dataset}
+
+#Use the function to create the sparse eset object
+counts.Qian <- create_count_matrix(seurat.Qian)
+eset.Qian.sparse <- create_sparse_eset_object_Qian(counts.Qian, seurat.Qian)
+unique(eset.Qian.sparse$CellFromTumor)
+unique(eset.Qian.sparse$PatientNumber)
+unique(eset.Qian.sparse$CellType)
+unique(eset.Qian.sparse$cluster_normalized)
+head(eset.Qian.sparse)
+```
+
+Creation of object for simulate bulk RNA-seq data from the scRNA-seq data. 
+```{r Qian.deconvolution.object.simulation.bulk.scrna}
+
+## (1) using all single cells
+start_time <- Sys.time()
+pseudo.Qian <- generateBulk_allcells(eset.Qian.sparse, ct.varname = "cluster_normalized", sample = "CellFromTumor", ct.sub = NULL)
+end_time <- Sys.time()
+end_time - start_time
+
+## (2) using random proportions of single cells
+start_time <- Sys.time()
+pseudo.rand.Qian <- generateBulk_norep(eset.Qian.sparse, ct.varname = "cluster_normalized", sample = "CellFromTumor", ct.sub = unique(eset.Qian.sparse$cluster_normalized), nbulk = 12)
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+### Deconvolution simulation {.tabset}
+
+Deconvolution with the 9 cell types in the Qian J. et al, 2020 paper, the idea is to see if we are able to recover fibroblast, cancer and epithelial cells proportions correctly.The following is the execution of the deconvolution with the simulated bulk database on the single-cell dataset. Given the Boostraping sampling, there is variability across different runs, however with a high boostrap.number, specifically in this case with 100, both the number of marker genes, the Pearson correlation, and the deviance have low variation. Be aware of the configuration of the machine that you are using for executing the deconvolution. In this case for each thread, you may need a maximum of 8 GB in RAM.
+```{r Qian.deconvolution.simulation.pseudo.normal}
+
+c_Qian.fl.sub <- c('Subcluster 1', 'Subcluster 2')
+c_Qian.sub <- paste0('cluster_', c(1,2,4,5))
+
+#.9059 Just fibroblast, endothelial and cancer cells.
+add_metacluster.Qian <- function (sc.eset){
+    
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(1,2))] <-  "Subcluster 1"
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(4,5))] <-  "Subcluster 2"
+
+  sc.eset
+}
+
+start_time <- Sys.time()
+
+#add the metacluster information
+eset.Qian.sparse.metacluster <- add_metacluster.Qian(eset.Qian.sparse)
+
+#run the tree guided with subclusters. 
+SCDC.Qian.tree_guided.qc.metacluster.parallelized <- SCDC_prop_subcl_marker(bulk.eset = pseudo.Qian$pseudo_eset ,
+                                                                                               sc.eset = eset.Qian.sparse.metacluster,
+                                                                                               ct.varname = "cluster_normalized", fl.varname = "metacluster",
+                                                                                               sample = "CellFromTumor",
+                                                                                               ct.sub = c_Qian.sub,
+                                                                                               ct.fl.sub = c_Qian.fl.sub,
+                                                                                               select.marker = TRUE,
+                                                                                               truep = pseudo.Qian$truep,
+                                                                                               parallelize = T, core_number = 4,
+                                                                                               marker_gene_strategy = 'boostrap_outliers',
+                                                                                               iteration.minimun_number_markers = 28,
+                                                                                               iteration.use_maximum = TRUE,
+                                                                                               iteration.maximo_genes = 35,
+                                                                                               iteration.use_final_foldchange = TRUE,
+                                                                                               epsilon = 0.001,
+                                                                                               weight.basis = F,
+                                                                                               bootstrap.number = 100,
+                                                                                               bootstrap.sample_size = 2,
+                                                                                               additional_genes = NULL
+                                                                                          )
+
+SCDC.Qian.tree_guided.qc.metacluster.parallelized$prop.est
+
+#initial r = 0.9059
+SCDC.Qian.tree_guided.qc.metacluster.parallelized$peval$evals.table
+SCDC.Qian.tree_guided.qc.metacluster.parallelized$peval$pearson.sample.table
+
+#  16.77464 min
+end_time <- Sys.time()
+end_time - start_time
+```
+
+
+### Deconvolution of the actual bulk data {.tabset}
+
+Execution of the deconvolution with the actual bulk data, using the optimized parameters found in the simulation.
+```{r Qian.deconvolution.actual.data.sc}
+
+c_Qian.fl.sub <- c('Subcluster 1', 'Subcluster 2')
+c_Qian.sub <- paste0('cluster_', c(1,2,4,5))
+
+
+#.9059 Just fibroblast, endothelial and cancer cells.
+add_metacluster.Qian <- function (sc.eset){
+    
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(1,2))] <-  "Subcluster 1"
+  sc.eset$metacluster[sc.eset$cluster_normalized %in%  paste0('cluster_',c(4,5))] <-  "Subcluster 2"
+
+  sc.eset
+}
+
+start_time <- Sys.time()
+
+#add the metacluster information
+eset.Qian.sparse.metacluster <- add_metacluster.Qian(eset.Qian.sparse)
+
+#run the tree guided with subclusters. 
+SCDC.Qian.tree_guided.qc.metacluster.parallelized.actual.data <- SCDC_prop_subcl_marker(bulk.eset = eset.bulk.colorectal,
+                                                                                               sc.eset = eset.Qian.sparse.metacluster,
+                                                                                               ct.varname = "cluster_normalized", fl.varname = "metacluster",
+                                                                                               sample = "CellFromTumor",
+                                                                                               ct.sub = c_Qian.sub,
+                                                                                               ct.fl.sub = c_Qian.fl.sub,
+                                                                                               select.marker = TRUE,
+                                                                                               parallelize = T, core_number = 4,
+                                                                                               marker_gene_strategy = 'boostrap_outliers',
+                                                                                               iteration.minimun_number_markers = 28,
+                                                                                               iteration.use_maximum = TRUE,
+                                                                                               iteration.maximo_genes = 35,
+                                                                                               iteration.use_final_foldchange = TRUE,
+                                                                                               epsilon = 0.001,
+                                                                                               weight.basis = F,
+                                                                                               bootstrap.number = 100,
+                                                                                               bootstrap.sample_size = 2,
+                                                                                               additional_genes = NULL
+                                                                                          )
+
+SCDC.Qian.tree_guided.qc.metacluster.parallelized.actual.data$prop.est
+
+# 9.978415 mins
+end_time <- Sys.time()
+end_time - start_time
+```
+
+
+## Result of the deconvolution: Proportions
+
+Estimated proportions of the bulk data calculated for the deconvolution library for each replica/Sample, including also the actual proportions of the single-cell data used as a reference.
+```{r Qian.deconvolution.plot.proportions.all, fig.width=12, fig.height=14}
+Qian.data.plot.proportions <- as.data.frame(SCDC.Qian.tree_guided.qc.metacluster.parallelized.actual.data$prop.est)
+
+
+#Adding the single cell proportions for the values of the actual data in three lines: Border, Tumor and Normal for comparison.
+Qian.data.plot.actual.proportions.df <- as.data.frame.matrix(pseudo.Qian$truep)
+rownames(Qian.data.plot.actual.proportions.df) <- c('[Qian] Normal', '[Qian] Tumor')
+#We filtered the columns with the one in the deconvolution proportions
+Qian.data.plot.actual.proportions.df <- Qian.data.plot.actual.proportions.df[, colnames(Qian.data.plot.proportions)]
+Qian.data.plot.proportions <- rbind(Qian.data.plot.actual.proportions.df, Qian.data.plot.proportions)
+
+
+Qian.data.plot.proportions <- cbind(sample = rownames(Qian.data.plot.proportions),
+                               Qian.data.plot.proportions)
+Qian.data.plot.proportions.df.melt <- Qian.data.plot.proportions %>% gather(cluster_normalized, proportion, 2:5)
+
+#adding the original cell type name
+Qian.data.plot.proportions.df.melt <- Qian.data.plot.proportions.df.melt %>% inner_join(cluster_list.Qian, by = "cluster_normalized")
+#adding labels from the sample pattern name
+Qian.data.plot.proportions.df.melt <- Qian.data.plot.proportions.df.melt %>% inner_join(list.columns.samples.all.df, by = "sample")
+
+#Different plots depend on the sorting
+
+#1.Adding a order for default
+list.columns.samples.all.df <- list.columns.samples.all.df[  with(list.columns.samples.all.df, order(global_order)),]
+proportions.deconvolution.Qian.plot.all.default <- Qian.plot.proportions.sorting(title = 'Deconvolution Qian paper: 4 cell types (default sorting)')
+print(proportions.deconvolution.Qian.plot.all.default)
+
+#2.Adding a order for the samples for patients
+list.columns.samples.all.df <- list.columns.samples.all.df[  with(list.columns.samples.all.df, order(type.order, patient_order)),]
+proportions.deconvolution.Qian.plot.all.sorting.type.patient <- Qian.plot.proportions.sorting(title = 'Deconvolution Qian paper: 4 cell types (type-patient sorting)')
+print(proportions.deconvolution.Qian.plot.all.sorting.type.patient)
+
+#3.sorting for patients and sampels
+list.columns.samples.all.df <- list.columns.samples.all.df[  with(list.columns.samples.all.df, order(patient, type.order)),]
+proportions.deconvolution.Qian.plot.all.sorting.patient.type <- Qian.plot.proportions.sorting(title = 'Deconvolution Qian paper: 4 cell types (patient-type sorting)')
+print(proportions.deconvolution.Qian.plot.all.sorting.patient.type)
+```
+
+
+## Result of the deconvolution: Marker geness
+
+
+We will use normalization over just the organoids expression data; this will show paterns just related with the organoids and not just with the fibroblast
+```{r Qian.deconvolution.plot.heatmap.samples.vs.markers.improved.just.organoids.specific.norm, fig.width=12, fig.height=14}
+#markers for the deconvolution
+Qian.deconvolution.markers <- c('RPL10', 'KRT8', 'KRT18', 'SLPI', 'MMP7', 'DEFB1', 'IFI27', 'HLA-B', 'KRT19', 'REG4', 'CLDN4', 'S100P', 'HLA-A', 'KRT16', 'RPLP1', 'S100A2', 'GSTP1', 'MUC13', 'TACSTD2', 'EIF1', 'PHLDA2', 'SMIM24', 'UBC', 'TSPAN8', 'IER2', 'PERP', 'GPRC5A', 'S100A16', 'PRAP1', 'EPCAM', 'S100A10', 'PSCA', 'TXN', 'PNRC1', 'NQO1', 'COL3A1', 'IGFBP7', 'SPARC', 'COL1A2', 'TAGLN', 'ACTA2', 'MGP', 'LUM', 'DCN', 'COL1A1', 'CFD', 'CCL11', 'CXCL14', 'CALD1', 'SFRP2', 'SFRP4', 'GSN', 'TIMP3', 'FN1', 'IGFBP6', 'MMP11', 'ADAMDEC1', 'COMP', 'VIM', 'G0S2', 'ASPN', 'TPM2', 'MYL9', 'MFAP5', 'C1QTNF3', 'ACTG2', 'RGS5', 'SERPINE2', 'DES', 'COL6A2', 'FABP4', 'RBP7', 'CD36', 'ACKR1', 'CLDN5', 'SPRY1', 'SLC9A3R2', 'PLVAP', 'ESM1', 'CAV1', 'RAMP2', 'FKBP1A', 'APLN', 'ECSCR.1', 'AQP1', 'SELE', 'ENG', 'VWF', 'GNG11', 'EMP1', 'SDPR', 'MGLL', 'INSR', 'CD59', 'EGFL7', 'NPDC1', 'HSPG2', 'RAMP3', 'SOCS3', 'ANGPT2', 'CD320', 'HYAL2', 'CD93', 'STC1', 'GJA4', 'GUCA2B', 'GUCA2A', 'ITLN1', 'AGR2', 'SPINK4', 'PHGR1', 'ZG16', 'PIGR', 'CA7', 'MT1G', 'CKB', 'CA1', 'FCGBP', 'SLC26A2', 'CLCA1', 'CLCA4', 'LGALS4', 'CA2', 'CEACAM7', 'SRI', 'CA4', 'SLC26A3', 'LGALS3', 'ETHE1', 'SELENBP1', 'MS4A12', 'RETNLB', 'C10orf99', 'SPINK5', 'TMEM54', 'FAM3D', 'PLAC8', 'FXYD3', 'ITM2C', 'ST6GALNAC1')
+
+#Checking markers of the publications against the one recovered for the deconvolution. In overal between 1% and 2%.
+Qian.markers.publication.vs.current.instance <- intersect(rownames(SCDC.Qian.tree_guided.qc.metacluster.parallelized.actual.data$basis.mvw), Qian.deconvolution.markers)
+paste0('Markers in the publication: ', length(Qian.deconvolution.markers), '. Markers shared with the current instance: ', length(Qian.markers.publication.vs.current.instance), '. Variation: ', round((1-(length(Qian.markers.publication.vs.current.instance)/length(Qian.deconvolution.markers))), 3)*10, '%')
+
+#bulk data with just the markers.
+Qian.markers.expression <- as.matrix(eset.bulk.colorectal@assayData$exprs[rownames(eset.bulk.colorectal@assayData$exprs) %in% Qian.deconvolution.markers,list.columns.samples.all.df[list.columns.samples.all.df$global_type == "organoids" & list.columns.samples.all.df$sample %!in% c('Border', 'Tumor', 'Normal', '[Qian] Normal', '[Qian] Tumor', '[smc] Normal', '[smc] Tumor'),]$sample])
+
+cal_z_score <- function(x){
+  (x - mean(x)) / sd(x)
+}
+ 
+Qian.markers.expression_norm <- t(apply(Qian.markers.expression, 1, cal_z_score))
+#Delete rows witn NA values, due to zero values in the expression matrix
+Qian.markers.expression_norm <- na.omit(Qian.markers.expression_norm)
+
+#annotation for columns
+list.columns.samples.all.df.filtered.Qian <- list.columns.samples.all.df[list.columns.samples.all.df$global_type == "organoids" & list.columns.samples.all.df$sample %!in% c('Border', 'Tumor', 'Normal', '[Qian] Normal', '[Qian] Tumor', '[smc] Normal', '[smc] Tumor'),]
+list.columns.samples.all.df.filtered.Qian <- list.columns.samples.all.df.filtered.Qian[  with(list.columns.samples.all.df.filtered.Qian, order(type.order, patient_order)),]
+
+#Now we will create the top annotation with the organoids type
+top.annotation.samples.type.Qian <- data.frame(sample = list.columns.samples.all.df.filtered.Qian$sample, sample.type = list.columns.samples.all.df.filtered.Qian$type, number = seq(1:36))
+rownames(list.columns.samples.all.df.filtered.Qian) <- list.columns.samples.all.df.filtered.Qian$sample
+
+sample.type <- data.frame(Condition = list.columns.samples.all.df.filtered.Qian$type, 
+                          Patient = list.columns.samples.all.df.filtered.Qian$patient)
+row.names(sample.type) <- list.columns.samples.all.df.filtered.Qian$sample
+sample.type$Condition <- factor(sample.type$Condition, levels = c("O_min", "O_enas", "O_caf", "O_nf", "caf_O", "nf_O", "caf", "nf"))
+sample.type$Patient <- factor(sample.type$Patient, levels = c("1", "2", "3"))
+       
+
+#reorder the matrix by the annotation order
+Qian.markers.expression_norm <- Qian.markers.expression_norm[,rownames(sample.type)]
+
+color.palette <- c("#fed976", "#225ea8", "#f768a1", "#42ab5d",
+                   "#d39200", "#db7fb4", "#a58aff", "#fb61d7", "#ce5445")
+
+#annotation colors
+annotation.colors <-list(Condition=c(O_min="#fed976", O_enas="#225ea8", O_caf="#f768a1", O_nf="#42ab5d", caf_O="#996B00", nf_O="#C975A6", caf="#a58aff", nf="#fb61d7"), Patient=c('1'="#1b9e77", '2'="#d95f02", '3'="#7570b3"))
+
+# create heatmap using pheatmap
+Qian.heatmap.advanced.condition.organoids.specific.norm <- pheatmap(Qian.markers.expression_norm,
+         main="Expr. samples vs marker genes - Deconvolution epithelial - Order Condition - Organoids - Spec NORM - Qian",
+         cluster_cols = FALSE,
+         show_rownames = FALSE,
+         fontsize_col = 8,
+         annotation_col = sample.type,
+         annotation_colors = annotation.colors,
+         gaps_col = c(9,18,27))
+print(Qian.heatmap.advanced.condition.organoids.specific.norm)
+
+Qian.heatmap.advanced.condition.organoids.specific.norm.genes <- pheatmap(Qian.markers.expression_norm,
+         main="Expr. samples vs marker genes - Deconvolution epithelial - Order Condition - Organoids - Spec NORM - Qian",
+         cluster_cols = FALSE,
+         show_rownames = TRUE,
+         fontsize_col = 8,
+         fontsize_row = 5,
+         annotation_col = sample.type,
+         annotation_colors = annotation.colors,
+         gaps_col = c(9,18,27))
+print(Qian.heatmap.advanced.condition.organoids.specific.norm.genes)
+
+#reorder the matrix by the annotation order
+sample.type <- sample.type[with(sample.type, order(Patient)),]
+Qian.markers.expression_norm <- Qian.markers.expression_norm[,rownames(sample.type)]
+
+Qian.heatmap.advanced.patient.organoids.specific.norm <- pheatmap(Qian.markers.expression_norm,
+         main="Expr. samples vs marker genes - Deconvolution epithelial - Order Patient - Organoids - Spec NORM - Qian",
+         cluster_cols = FALSE,
+         show_rownames = FALSE,
+         fontsize_col = 8,
+         annotation_col = sample.type,
+         annotation_colors = annotation.colors,
+         gaps_col = c(12,24)
+         )
+print(Qian.heatmap.advanced.patient.organoids.specific.norm)
+
+
+Qian.heatmap.advanced.patient.organoids.specific.norm.genes <- pheatmap(Qian.markers.expression_norm,
+         main="Expr. samples vs marker genes - Deconvolution epithelial - Order Patient - Organoids - Spec NORM - Qian",
+         cluster_cols = FALSE,
+         show_rownames = TRUE,
+         fontsize_col = 8,
+         fontsize_row = 5,
+         annotation_col = sample.type,
+         annotation_colors = annotation.colors,
+         gaps_col = c(12,24)
+         )
+print(Qian.heatmap.advanced.patient.organoids.specific.norm.genes)
+```
+
