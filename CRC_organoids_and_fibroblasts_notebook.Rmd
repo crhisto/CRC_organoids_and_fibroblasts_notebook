@@ -157,7 +157,7 @@ if(manual_inspection){
 ```
 
 Now we have to create the object with the bulk data to run the deconvolution.
-```{r bulk.data.creation}
+```{r bulk.data.creation, include=FALSE}
 
 #create the matrix of counts with the samples or replicas that we selected.
 counts.colorectal <- Matrix(as.matrix(bulk.counting.matrix.filtered[,list.columns.samples.filtered]), sparse = TRUE)
@@ -166,7 +166,6 @@ counts.colorectal <- Matrix(as.matrix(bulk.counting.matrix.filtered[,list.column
 fdata.colorectal <- rownames(counts.colorectal)
 pdata.colorectal <- cbind(subjects = colnames(counts.colorectal))
 eset.bulk.colorectal <- getESET(counts.colorectal, fdata = fdata.colorectal, pdata = pdata.colorectal)
-eset.bulk.colorectal
 ```
 
 # 1. Deconvolutions using SMC dataset from Lee H. et al, 2020
@@ -177,6 +176,8 @@ We used the SMC dataset of the publication, which is a ScRNA-seq of unsorted CRC
 
 Download 1 set of files with Single Cell data corresponding to the paper: Lineage-dependent gene expression programs influence the immune landscape of colorectal cancer (https://pubmed.ncbi.nlm.nih.gov/32451460/): 
 ```{bash Lee.download_files, eval = FALSE}
+cd data/
+mkdir sc_datasets
 cd data/sc_datasets/
 
 #downloading the scRNA-seq dataset No.1
@@ -374,7 +375,7 @@ print(smc.Lee.umap.plot.normal.epithelial.cells)
 ## Deconvolution pipeline: Epithelial Cells {.tabset}
 
 Creation of object with the scRNA-seq data for the deconvolution
-```{r smc.Lee.epithelial.deconvolution.simulation.preparing.dataset}
+```{r smc.Lee.epithelial.deconvolution.simulation.preparing.dataset, include=FALSE}
 
 #Use the function to create the sparse eset object
 counts.smc.epithelial <- create_count_matrix(seurat.smc.epithelial)
@@ -383,12 +384,10 @@ unique(eset.smc.epithelial.sparse$cell_type)
 unique(eset.smc.epithelial.sparse$class)
 unique(eset.smc.epithelial.sparse$cell_subtype)
 unique(eset.smc.epithelial.sparse$cluster_normalized)
-head(eset.smc.epithelial.sparse)
-
 ```
 
 Creation of object for simulate bulk RNA-seq data from the scRNA-seq data. 
-```{r smc.Lee.epithelial.deconvolution.object.simulation.bulk.scrna}
+```{r smc.Lee.epithelial.deconvolution.object.simulation.bulk.scrna, include=FALSE}
 
 ## (1) using all single cells
 start_time <- Sys.time()
@@ -437,7 +436,7 @@ SCDC.epithelial.tree_guided.qc.metacluster.parallelized <- SCDC_prop_subcl_marke
                                                                                                ct.fl.sub = c_epithelial.fl.sub,
                                                                                                select.marker = TRUE,
                                                                                                truep = pseudo.smc.epithelial$truep,
-                                                                                               parallelize = T, core_number = 3,
+                                                                                               parallelize = T, core_number = 5,
                                                                                                marker_gene_strategy = 'boostrap_outliers',
                                                                                                iteration.minimun_number_markers = 28,
                                                                                                iteration.use_maximum = TRUE,
@@ -491,7 +490,7 @@ SCDC.epithelial.tree_guided.qc.metacluster.parallelized.rand <- SCDC_prop_subcl_
                                                                                                ct.fl.sub = c_epithelial.fl.sub,
                                                                                                select.marker = TRUE,
                                                                                                truep = pseudo.rand.smc.epithelial$true_p,
-                                                                                               parallelize = T, core_number = 3,
+                                                                                               parallelize = T, core_number = 5,
                                                                                                marker_gene_strategy = 'boostrap_outliers',
                                                                                                iteration.minimun_number_markers = 28,
                                                                                                iteration.use_maximum = TRUE,
@@ -602,17 +601,17 @@ print(proportions.deconvolution.epithelial.plot.all.default)
 
 #2.Adding a order for the samples for patients
 list.columns.samples.all.df <- list.columns.samples.all.df[  with(list.columns.samples.all.df, order(type.order, patient_order)),]
-proportions.deconvolution.epithelial.plot.all.sorting.type.patient <- plot.proportions.sorting(title = 'Deconvolution epithelial cells: 73 samples (type-patient sorting) - smc', data.plot.proportions.df.melt)
+proportions.deconvolution.epithelial.plot.all.sorting.type.patient <- smc.plot.proportions.sorting(title = 'Deconvolution epithelial cells: 73 samples (type-patient sorting) - smc', data.plot.proportions.df.melt)
 print(proportions.deconvolution.epithelial.plot.all.sorting.type.patient)
 
 #3.sorting for patients and sampels
 list.columns.samples.all.df <- list.columns.samples.all.df[  with(list.columns.samples.all.df, order(patient, type.order)),]
-proportions.deconvolution.epithelial.plot.all.sorting.patient.type <- plot.proportions.sorting(title = 'Deconvolution epithelial cells: 73 samples (patient-type sorting) - smc', data.plot.proportions.df.melt)
+proportions.deconvolution.epithelial.plot.all.sorting.patient.type <- smc.plot.proportions.sorting(title = 'Deconvolution epithelial cells: 73 samples (patient-type sorting) - smc', data.plot.proportions.df.melt)
 print(proportions.deconvolution.epithelial.plot.all.sorting.patient.type)
 
 #3.1.sorting for patients and sampels: just organoids
 list.columns.samples.all.df <- list.columns.samples.all.df[ with(list.columns.samples.all.df, order(patient, type.order)),]
-proportions.deconvolution.epithelial.plot.all.sorting.patient.type.organoids <- plot.proportions.sorting(title = 'Deconvolution epithelial cells: 36 ORGANOIDS samples (patient-type sorting) - smc', data.plot.proportions.df.melt[data.plot.proportions.df.melt$global_type == 'organoids',])
+proportions.deconvolution.epithelial.plot.all.sorting.patient.type.organoids <- smc.plot.proportions.sorting(title = 'Deconvolution epithelial cells: 36 ORGANOIDS samples (patient-type sorting) - smc', data.plot.proportions.df.melt[data.plot.proportions.df.melt$global_type == 'organoids',])
 print(proportions.deconvolution.epithelial.plot.all.sorting.patient.type.organoids)
 ```
 
@@ -861,7 +860,7 @@ DimPlot(seurat.Qian, label = T, reduction = "umap", label.size = 5, split.by = "
 ## Deconvolution pipeline {.tabset}
 
 Creation of object with the scRNA-seq data for the deconvolution
-```{r Qian.deconvolution.simulation.preparing.dataset}
+```{r Qian.deconvolution.simulation.preparing.dataset, include=FALSE}
 
 #Use the function to create the sparse eset object
 counts.Qian <- create_count_matrix(seurat.Qian)
@@ -870,11 +869,10 @@ unique(eset.Qian.sparse$CellFromTumor)
 unique(eset.Qian.sparse$PatientNumber)
 unique(eset.Qian.sparse$CellType)
 unique(eset.Qian.sparse$cluster_normalized)
-head(eset.Qian.sparse)
 ```
 
 Creation of object for simulate bulk RNA-seq data from the scRNA-seq data. 
-```{r Qian.deconvolution.object.simulation.bulk.scrna}
+```{r Qian.deconvolution.object.simulation.bulk.scrna, include=FALSE}
 
 ## (1) using all single cells
 start_time <- Sys.time()
@@ -892,7 +890,7 @@ end_time - start_time
 
 ### Deconvolution simulation {.tabset}
 
-Deconvolution with the 9 cell types in the Qian J. et al, 2020 paper, the idea is to see if we are able to recover fibroblast, cancer and epithelial cells proportions correctly.The following is the execution of the deconvolution with the simulated bulk database on the single-cell dataset. Given the Boostraping sampling, there is variability across different runs, however with a high boostrap.number, specifically in this case with 100, both the number of marker genes, the Pearson correlation, and the deviance have low variation. Be aware of the configuration of the machine that you are using for executing the deconvolution. In this case for each thread, you may need a maximum of 8 GB in RAM.
+Deconvolution with the 9 cell types in the Qian J. et al, 2020 paper. The idea is to see if we are able to recover fibroblast, cancer and epithelial cells proportions correctly. The following is the execution of the deconvolution with the simulated bulk database on the single-cell dataset. Given the Boostraping sampling, there is variability across different runs, however with a high boostrap.number, specifically in this case with 100, both the number of marker genes, the Pearson correlation, and the deviance have low variation. Be aware of the configuration of the machine that you are using for executing the deconvolution. In this case for each thread, you may need a maximum of 8 GB in RAM.
 ```{r Qian.deconvolution.simulation.pseudo.normal}
 
 c_Qian.fl.sub <- c('Subcluster 1', 'Subcluster 2')
@@ -1137,5 +1135,11 @@ Qian.heatmap.advanced.patient.organoids.specific.norm.genes <- pheatmap(Qian.mar
          gaps_col = c(12,24)
          )
 print(Qian.heatmap.advanced.patient.organoids.specific.norm.genes)
+```
+
+Finally this is the session info of R.
+```{r session.info}
+#Information about the current R session
+sessionInfo()
 ```
 
