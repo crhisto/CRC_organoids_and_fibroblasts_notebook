@@ -30,5 +30,5 @@ In order to execute the complete pipeline, at the beginning of the R Notebook th
    - **Modifications**: Compatibility with sparse matrices using: `dgCMatrix` objects in R.
    - **Original repository**: https://github.com/renozao/xbioc
             
-biorxiv: [Mimicking tumor cell heterogeneity of colorectal cancer in a patient-derived organoid-fibroblast model
-](https://doi.org/10.1101/2022.03.07.483214)
+Publication: [Mimicking tumor cell heterogeneity of colorectal cancer in a patient-derived organoid-fibroblast model
+](https://doi.org/10.1016/j.jcmgh.2023.02.014)
